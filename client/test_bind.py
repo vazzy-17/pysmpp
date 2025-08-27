@@ -31,7 +31,7 @@ client.connect()
 client.bind_transceiver(system_id='test3', password='santos')
 
 # Kirim SMS
-parts, encoding_flag, msg_type_flag = smpplib.gsm.make_parts('Selamat datang di dunia teknologi% modern! Hari ini kita belajar bagaimana memanfaatkan Rust, Python, dan sistem SMPP untuk mengirim pesan secara efisien ke banyak pengguna.')
+parts, encoding_flag, msg_type_flag = smpplib.gsm.make_parts('Test kirim kedua - 2.')
 for part in parts:
     pdu = client.send_message(
         source_addr_ton=smpplib.consts.SMPP_TON_ALNUM,
@@ -49,7 +49,7 @@ for part in parts:
 
 # Tunggu agar bisa menerima deliver_sm
 # Dalam loop, `client.read_once()` akan membaca dan memproses semua PDU masuk
-timeout = time.time() + 15  # Tunggu sampai 15 detik
+timeout = time.time() + 150  # Tunggu sampai 15 detik
 while time.time() < timeout:
     client.read_once()
     time.sleep(1)

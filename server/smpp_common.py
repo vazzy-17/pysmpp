@@ -1,11 +1,20 @@
+# smpp_common.py
 import struct
 import uuid
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional, Tuple
+from server.credential_watcher import start_credential_watcher, GLOBAL_CREDENTIALS
+from time import strftime
+from typing import Optional, TYPE_CHECKING
 
-SUPPLIER_CLIENT: Optional[SmppClient] = None
-CLIENT_SESSIONS: dict[str, SmppServerProtocol] = {}
+if TYPE_CHECKING:
+    from server.server import SmppServerProtocol
+    from client.client_01 import SmppClient
+
+SUPPLIER_CLIENT: Optional["SmppClient"] = None
+CLIENT_SESSIONS: dict[str, "SmppServerProtocol"] = {}
+
 # -----------------------------
 # SMPP Constants
 # -----------------------------
@@ -91,6 +100,17 @@ class PDU:
     sequence: int
     body: bytes
 
+    def __init__(self, command_id, command_status, sequence, body: bytes):
+        self.command_id = command_id
+        self.command_status = command_status
+        self.sequence = sequence
+        self.body = body
+
+        # default, nanti bisa diisi setelah parsing submit_sm/deliver_sm
+        self.source_addr = ""
+        self.destination_addr = ""
+        self.params = {}  # TLV, message_state, dsb.
+
     def pack(self) -> bytes:
         total_len = HEADER_LEN + len(self.body)
         header = struct.pack(HEADER_FMT, total_len, self.command_id, self.command_status, self.sequence)
@@ -104,6 +124,16 @@ class PDU:
         if length != len(data):
             raise ValueError(f"length mismatch: header={length} actual={len(data)}")
         return PDU(cmd_id, status, seq, data[HEADER_LEN:])
+    
+    def short_message(self):
+        """
+        Ambil short_message dari body. 
+        Default coba decode UTF-8, bisa ganti jika body UCS2 atau GSM 7-bit.
+        """
+        try:
+            return self.body.decode('utf-8')
+        except Exception:
+            return self.body
     
 # -----------------------------
 # PDU Builders & Parsers
@@ -207,6 +237,62 @@ def build_submit_sm(source_addr: str, dest_addr: str, short_message: str,
             pdus.append(PDU(CommandId.submit_sm, 0, seq, body).pack())
             seq += 1
         return pdus
+def build_submit_sm_pdu(source_addr: str, dest_addr: str, short_message: str,
+                        source_ton: int = Ton.INTERNATIONAL,
+                        source_npi: int = Npi.ISDN,
+                        dest_ton: int = Ton.INTERNATIONAL,
+                        dest_npi: int = Npi.ISDN,
+                        data_coding: int = 0,
+                        start_sequence: int = 1) -> list[PDU]:
+    """
+    Return list of PDU object, bukan bytes
+    """
+    if data_coding == 8:
+        max_len = 67
+        encode_fn = lambda s: s.encode("utf-16-be")
+    else:
+        max_len = 153
+        encode_fn = lambda s: s.encode("ascii", errors="replace")
+
+    encoded = encode_fn(short_message)
+    segments = [encoded[i:i + max_len] for i in range(0, len(encoded), max_len)]
+    total = len(segments)
+    ref_num = uuid.uuid4().int & 0xFF
+    pdus = []
+
+    for idx, seg in enumerate(segments, start=1):
+        if total > 1:
+            udh = bytes([0x05, 0x00, 0x03, ref_num, total, idx])
+            msg = udh + seg
+            esm_class = 0x40
+        else:
+            msg = seg
+            esm_class = 0x00
+
+        body = b"".join([
+            cstring(""),  # service_type
+            struct.pack(">B", source_ton),
+            struct.pack(">B", source_npi),
+            cstring(source_addr),
+            struct.pack(">B", dest_ton),
+            struct.pack(">B", dest_npi),
+            cstring(dest_addr),
+            struct.pack(">B", esm_class),
+            struct.pack(">B", 0),  # protocol_id
+            struct.pack(">B", 0),  # priority_flag
+            cstring(""),  # schedule_delivery_time
+            cstring(""),  # validity_period
+            struct.pack(">B", 1),  # registered_delivery
+            struct.pack(">B", 0),  # replace_if_present_flag
+            struct.pack(">B", data_coding),
+            struct.pack(">B", 0),  # sm_default_msg_id
+            struct.pack(">B", len(msg)),
+            msg
+        ])
+        pdus.append(PDU(CommandId.submit_sm, 0, start_sequence, body))
+        start_sequence += 1
+
+    return pdus
 def parse_submit_sm_body(body: bytes):
     mv = memoryview(body)
     off = 0

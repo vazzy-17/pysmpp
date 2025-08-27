@@ -6,6 +6,8 @@ from watchdog.events import FileSystemEventHandler
 from typing import Callable
 GLOBAL_CREDENTIALS: dict[str, str] = {}
 
+
+
 def load_credentials(filepath:str) -> dict[str, str]:
     credentials = {}
     with open(filepath, "r", encoding="utf-8") as f:

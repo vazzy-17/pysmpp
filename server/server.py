@@ -1,19 +1,24 @@
-# smpp_server.py
+# server.py
 from __future__ import annotations
 import asyncio
 import logging
 import uuid
 import struct
-from time import strftime
-from credential_watcher import start_credential_watcher, GLOBAL_CREDENTIALS, load_credentials
+from server.credential_watcher import start_credential_watcher, GLOBAL_CREDENTIALS, load_credentials
 
-from others.smpp_common import (
+from server.smpp_common import (
     PDU, CommandId, CommandStatus, Ton, Npi, DLR_STATUS_MAP,
     build_bind_transceiver_resp, parse_bind_transceiver_body,
     build_enquire_link_resp, build_submit_sm, parse_submit_sm_body,
     strip_udh_and_decode, build_deliver_sm_dlr, read_cstring,
     SUPPLIER_CLIENT, CLIENT_SESSIONS
 )
+# # -----------------------------
+# # Credential store (dynamic)
+# # -----------------------------
+def apply_new_credentials(new_creds: dict):
+    GLOBAL_CREDENTIALS.clear()
+    GLOBAL_CREDENTIALS.update(new_creds)
 
 class SmppServerProtocol(asyncio.Protocol):
     def __init__(self, min_version: int = 0x33, max_version: int = 0x34):
@@ -38,6 +43,8 @@ class SmppServerProtocol(asyncio.Protocol):
         if self.bound and self.expected_system_id in CLIENT_SESSIONS:
             del CLIENT_SESSIONS[self.expected_system_id]
         self.logger.info(f"Connection lost: {self.peer}")
+    
+    
 
     async def send_dlr_later(self, msg_id, source, dest, delay=2.0, status_code=0):
         await asyncio.sleep(delay)
@@ -100,15 +107,15 @@ class SmppServerProtocol(asyncio.Protocol):
             raw_msg_id = str(uuid.uuid4())
 
             if SUPPLIER_CLIENT:
-                await SUPPLIER_CLIENT.submit_sm(msg["source_addr"], msg["dest_addr"], decoded_text)
+                responses = await SUPPLIER_CLIENT.submit_sm(msg["source_addr"], msg["dest_addr"], decoded_text)
+                status = responses[0].command_status if responses else CommandStatus.ESME_RSYSERR
+            else:
+                status = CommandStatus.ESME_RSYSERR
 
+            # Gunakan status yang sudah dicek
             msg_id = raw_msg_id.encode("ascii") + b"\x00"
-            resp = PDU(CommandId.submit_sm_resp, CommandStatus.ESME_ROK, pdu.sequence, msg_id).pack()
+            resp = PDU(CommandId.submit_sm_resp, status, pdu.sequence, msg_id).pack()
             self.transport.write(resp)
-
-            if msg["registered_delivery"] == 1:
-                asyncio.create_task(self.send_dlr_later(raw_msg_id, msg["dest_addr"], msg["source_addr"]))
-
             return
 
         if pdu.command_id == CommandId.deliver_sm_resp:
@@ -122,14 +129,18 @@ class SmppServerProtocol(asyncio.Protocol):
 # ----------------------------------------
 async def run_server():
     logging.basicConfig(level=logging.DEBUG)
-    creds = load_credentials("credentials.txt")
+    # creds = load_credentials("credentials.txt")
+    import os
+    current_dir = os.path.dirname(__file__)
+    creds = load_credentials(os.path.join(current_dir, "credentials.txt"))
     GLOBAL_CREDENTIALS.update(creds)
     start_credential_watcher("credentials.txt", apply_new_credentials)
 
-    from smpp_client import SmppClient  # import here to avoid circular import
+    from client.client_01 import SmppClient  # import here to avoid circular import
 
     global SUPPLIER_CLIENT
-    SUPPLIER_CLIENT = SmppClient("127.0.0.1", 2025, "aggregator", "aggregatorpass")
+    # SUPPLIER_CLIENT = SmppClient("127.0.0.1", 2025, "aggregator", "aggregatorpass")
+    SUPPLIER_CLIENT = SmppClient("sms-gw.redision.com", 37002, "dwi_test", "123456")
     await SUPPLIER_CLIENT.connect()
     await SUPPLIER_CLIENT.bind_transceiver()
 
