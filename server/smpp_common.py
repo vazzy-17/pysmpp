@@ -53,6 +53,7 @@ class CommandStatus(IntEnum):
     ESME_RINVPASWD          = 0x0000000E
     ESME_RINVSYSID          = 0x0000000F
     ESME_RINVVER            = 0x0000000A
+
 class Ton(IntEnum):
     UNKNOWN = 0
     INTERNATIONAL = 1

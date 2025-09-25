@@ -5,11 +5,20 @@ import logging
 import smpplib.consts
 from server.smpp_common import (
     PDU, CommandId, CommandStatus, HEADER_LEN, HEADER_FMT,
-    build_bind_transceiver, build_enquire_link, read_cstring,
-    parse_deliver_sm, CLIENT_SESSIONS
+    build_bind_transceiver, build_enquire_link,build_enquire_link_resp, read_cstring,
+    parse_deliver_sm, CLIENT_SESSIONS, build_submit_sm_pdu
 )
-from server.smpp_common import build_submit_sm_pdu  # kita akan buat ini
 
+COMMAND_STATUS_DESCRIPTIONS = {
+    0x00000000: "OK",
+    0x00000001: "Invalid message length",
+    0x00000002: "Invalid command length",
+    0x00000003: "Invalid command ID",
+    0x00000008: "System error",
+    0x0000000E: "Invalid password",
+    0x0000000F: "Invalid system ID",
+    0x000000FF: "Message queue full",
+}
 
 class SmppClient:
     def __init__(self, host, port, system_id, password):
@@ -82,16 +91,18 @@ class SmppClient:
                 continue
 
             # deliver_sm (DLR atau inbound message)
-            if pdu.command_id == smpplib.consts.CMD_ID_DELIVER_SM:
+            if pdu.command_id == CommandId.deliver_sm:
                 logging.info(f"📩 deliver_sm received: from={pdu.source_addr}, to={pdu.destination_addr}, msg={pdu.short_message}")
                 asyncio.create_task(self._handle_deliver_sm(pdu))
                 continue
 
             # enquire_link
-            if pdu.command_id == smpplib.consts.CMD_ID_ENQUIRE_LINK:
+            if pdu.command_id == CommandId.enquire_link:
                 logging.info("🔄 enquire_link received, sending response")
-                await self._send_enquire_link_resp(pdu.sequence)
+                await build_enquire_link(pdu.sequence)
                 continue
+
+            
 
             # unhandled PDU
             logging.warning(f"⚠️ Unknown PDU type: cmd_id=0x{pdu.command_id:08X}, seq={pdu.sequence}")
@@ -108,7 +119,7 @@ class SmppClient:
         logging.info(f"DLR/Inbound msg: from={pdu.source_addr}, to={pdu.destination_addr}, state={msg_state}, msg={pdu.short_message}")
 
         # forward ke client
-        await self.forward_to_client(pdu)
+        # await self.forward_to_client(pdu)
 
     async def send_submit_sm(self, pdu):
         """
@@ -119,8 +130,8 @@ class SmppClient:
         self._pending[seq] = future
 
         pdu.sequence = seq
-        self._writer.write(pdu.pack())
-        await self.writer.drain()
+        self.writer.write(pdu.pack())
+        await self._writer.drain()
         logging.info(f"➡️ submit_sm sent: seq={seq}, to={pdu.destination_addr}, msg={pdu.short_message}")
 
         # tunggu submit_sm_resp
@@ -154,8 +165,26 @@ class SmppClient:
     async def _keepalive(self):
         while True:
             await asyncio.sleep(60)
-            self.writer.write(build_enquire_link(self.next_seq()))
+
+            seq = self.next_seq()
+            pdu = build_enquire_link(seq)
+
+            future = asyncio.get_event_loop().create_future()
+            self._pending[seq] = future
+
+            self.writer.write(pdu)
             await self.writer.drain()
+            self.logger.debug(f"sent enquire_link with seq={seq}")
+
+            try:
+                resp = await asyncio.wait_for(future, timeout=10)
+                self.logger.debug(f"received enquire_link_resp for seq={seq}")
+            except asyncio.TimeoutError:
+                self.logger.warning(f"time out waiting for enquire_link_resp seq={seq}")
+                del self._pending[seq]
+
+            # self.writer.write(build_enquire_link(self.next_seq()))
+            # await self.writer.drain()
 
     async def submit_sm(self, src, dst, text):
         self.logger.info(f"📤 Mengirim submit_sm: from={src}, to={dst}, text={text}")
@@ -175,7 +204,9 @@ class SmppClient:
 
             try:
                 resp = await asyncio.wait_for(future, timeout=10)
-                self.logger.info(f"📥 Respon submit_sm dari supplier: {resp}")
+                desc = COMMAND_STATUS_DESCRIPTIONS.get(resp.command_status, "Unknown error")
+                self.logger.warning(f"📥 Respon submit_sm dari supplier: status=0x{resp.command_status:02X} ({desc})")
+
                 responses.append(resp)
             except asyncio.TimeoutError:
                 self.logger.error(f"⏰ Timeout menunggu submit_sm_resp untuk seq={seq}")

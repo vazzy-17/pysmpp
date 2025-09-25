@@ -3,7 +3,7 @@ import struct
 import uuid
 import logging
 from time import strftime
-from smppsvr import (
+from server.smpp_common import (
     PDU, HEADER_FMT, HEADER_LEN, CommandId, CommandStatus,
     parse_bind_transceiver_body, build_bind_transceiver_resp,
     parse_submit_sm_body, strip_udh_and_decode,
