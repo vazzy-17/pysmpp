@@ -15,16 +15,18 @@ def handle_deliver_sm(pdu):
     logging.info(f"  Message ID: {pdu.message_id if hasattr(pdu, 'message_id') else 'N/A'}")
 
 # Inisialisasi client
-client = smpplib.client.Client('sms-gw.aurateknologi.com', 37002)
+# client = smpplib.client.Client('sms-gw.aurateknologi.com', 37002)
+client = smpplib.client.Client('127.0.0.1', 37002)
 client.set_message_received_handler(handle_deliver_sm)
 
 # Connect & bind
 client.connect()
+# client.bind_transceiver(system_id='dwi_test', password='123456')
 client.bind_transceiver(system_id='dwi_test', password='123456')
 logging.info("✅ Bind berhasil")
 
 # Kirim SMS (UCS2)
-message_text = "你好！这是测试"
+message_text = "test dari python 25 september 2"
 pdu = client.send_message(
     source_addr_ton=smpplib.consts.SMPP_TON_ALNUM,
     source_addr_npi=0,

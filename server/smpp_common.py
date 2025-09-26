@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional, Tuple
-from server.credential_watcher import start_credential_watcher, GLOBAL_CREDENTIALS
+from server.credential_watcher import  GLOBAL_CREDENTIALS
 from time import strftime
 from typing import Optional, TYPE_CHECKING
 

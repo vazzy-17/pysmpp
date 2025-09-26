@@ -1,10 +1,16 @@
 # server.py
+
+
 from __future__ import annotations
+from server.db import DB
+from dotenv import load_dotenv
+import hashlib
+import os
 import asyncio
 import logging
 import uuid
 import struct
-from server.credential_watcher import start_credential_watcher, GLOBAL_CREDENTIALS, load_credentials
+from server.credential_watcher import GLOBAL_CREDENTIALS, load_credentials, apply_new_credentials
 # Di level global
 dict_lock = asyncio.Lock()
 
@@ -18,6 +24,9 @@ from server.smpp_common import (
     strip_udh_and_decode, build_deliver_sm_dlr, read_cstring,
     SUPPLIER_CLIENT, CLIENT_SESSIONS
 )
+
+load_dotenv()
+db=DB(os.getenv("DATABASE_URL2"))
 # # -----------------------------
 # # Credential store (dynamic)
 # # -----------------------------
@@ -90,7 +99,7 @@ class SmppServerProtocol(asyncio.Protocol):
                 status = CommandStatus.ESME_RINVVER
             elif params["system_id"] not in GLOBAL_CREDENTIALS:
                 status = CommandStatus.ESME_RINVSYSID
-            elif GLOBAL_CREDENTIALS[params["system_id"]] != params["password"]:
+            elif GLOBAL_CREDENTIALS[params["system_id"]] != hashlib.sha256(params["password"].encode()).digest():
                 status = CommandStatus.ESME_RINVPASWD
             elif self.bound:
                 status = CommandStatus.ESME_RALYBND
@@ -116,7 +125,22 @@ class SmppServerProtocol(asyncio.Protocol):
                 CLIENT_SESSIONS[msg["source_addr"]] = self
             decoded_text = strip_udh_and_decode(msg["short_message"], msg["data_coding"])
             
-            raw_msg_id = str(uuid.uuid4())
+            # raw_msg_id = str(uuid.uuid4())
+            peer_ip, _ = self.transport.get_extra_info("peername")
+            try:
+                account_ip_id = await db.get_account_ip_id(peer_ip)
+            except ValueError as e:
+                self.logger.error(f"❌ {e}")
+                return
+
+            raw_msg_id = await db.insert_log(
+                source=msg["source_addr"],
+                msisdn=msg["dest_addr"],
+                message=decoded_text,
+                account_ip = account_ip_id,
+                gtw_id= int(os.getenv("GTW_ID",4)),
+                telco_id=7
+            )
 
             async with dict_lock:
                 CLIENT_MSGID_MAP[raw_msg_id] = {
@@ -162,9 +186,15 @@ async def run_server():
     # creds = load_credentials("credentials.txt")
     import os
     current_dir = os.path.dirname(__file__)
-    creds = load_credentials(os.path.join(current_dir, "credentials.txt"))
-    GLOBAL_CREDENTIALS.update(creds)
-    start_credential_watcher("credentials.txt", apply_new_credentials)
+
+    # creds = load_credentials(os.path.join(current_dir, "credentials.txt"))
+    # GLOBAL_CREDENTIALS.update(creds)
+    # start_credential_watcher("credentials.txt", apply_new_credentials)
+    await db.connect()
+    creds = await load_credentials(db)
+    apply_new_credentials(creds)
+
+    
 
     from client.client_01 import SmppClient  # import here to avoid circular import
 
