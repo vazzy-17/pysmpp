@@ -7,14 +7,17 @@ from typing import Optional, Tuple
 from server.credential_watcher import  GLOBAL_CREDENTIALS
 from time import strftime
 from typing import Optional, TYPE_CHECKING
+import asyncio
 
 if TYPE_CHECKING:
     from server.server import SmppServerProtocol
     from client.client_01 import SmppClient
 
+dict_lock = asyncio.Lock()
 SUPPLIER_CLIENT: Optional["SmppClient"] = None
 CLIENT_SESSIONS: dict[str, "SmppServerProtocol"] = {}
-
+SUPPLIER_TO_CLIENT_MSGID = {}  # supplier_msgid -> client_msgid
+CLIENT_MSGID_MAP = {}          # client_msgid -> {system_id, source_addr, dest_addr}
 # -----------------------------
 # SMPP Constants
 # -----------------------------
@@ -39,6 +42,7 @@ class CommandId(IntEnum):
     bind_receiver_resp  = 0x80000001
     bind_transmitter_resp   = 0x80000002
     bind_transceiver_resp   = 0x80000009
+
 class CommandStatus(IntEnum):
     ESME_ROK                = 0x00000000
     ESME_RINVMSGLEN         = 0x00000001
@@ -63,13 +67,29 @@ class Npi(IntEnum):
     UNKNOWN = 0
     ISDN = 1
 DLR_STATUS_MAP = {
-    0: "DELIVRD",
-    1: "EXPIRED",
-    2: "DELETED",
-    3: "UNDELIV",
-    4: "ACCEPTD",
-    5: "UNKNOWN",
-    6: "REJECTD",
+    "DELIVRD": "Delivered",
+    "EXPIRED": "Expired", 
+    "DELETED": "Deleted",
+    "UNDELIV": "Undeliverable",
+    "ACCEPTD": "Accepted",
+    "UNKNOWN": "Unknown",
+    "REJECTD": "Rejected",
+
+    # Extended status
+    "ENROUTE": "Enroute",
+    "ACCEPTED": "Accepted",
+    "FAILED": "Failed",
+    "DELIVERED": "Delivered",
+    "UNDELIVERABLE": "Undeliverable",
+
+    # Numeric status codes
+    "0": "DELIVRD",
+    "1": "EXPIRED", 
+    "2": "DELETED",
+    "3": "UNDELIV",
+    "4": "ACCEPTD",
+    "5": "UNKNOWN",
+    "6": "REJECTD"
 }
 
 # -----------------------------
@@ -349,43 +369,140 @@ def parse_submit_sm_body(body: bytes):
         "short_message": short_message,
     }
 def parse_deliver_sm(body: bytes) -> dict:
-    mv = memoryview(body)
-    off = 0
-    service_type, off = read_cstring(mv, off)
-    source_addr_ton = mv[off]; off+=1
-    source_addr_npi = mv[off]; off+=1
-    source_addr, off = read_cstring(mv, off)
-    dest_addr_ton = mv[off]; off+=1
-    dest_addr_npi = mv[off]; off+=1
-    dest_addr, off = read_cstring(mv, off)
-    esm_class = mv[off]; off+=1
-    protocol_id = mv[off]; off+=1
-    priority_flag = mv[off]; off+=1
-    schedule_delivery_time, off = read_cstring(mv, off)
-    validity_period, off = read_cstring(mv, off)
-    registered_delivery = mv[off]; off+=1
-    replace_if_present_flag = mv[off]; off+=1
-    data_coding = mv[off]; off+=1
-    sm_default_msg_id = mv[off]; off+=1
-    sm_length = mv[off]; off+=1
-    short_message = bytes(mv[off:off+sm_length])
-    return {
-        "source_addr": source_addr,
-        "dest_addr": dest_addr,
-        "text": short_message.decode("ascii", errors="replace")
-    }
-def build_deliver_sm_dlr(msg_id: str, source_addr: str, dest_addr: str, stat: str = "DELIVRD", sequence: int = 1) -> bytes:
+    """
+    Parse deliver_sm PDU dengan approach yang lebih robust.
+    Handle berbagai format dan edge cases.
+    """
+    try:
+        offset = 0
+        fields = {}
+        
+        # Helper function untuk read cstring
+        def read_cstring_safe():
+            nonlocal offset
+            if offset >= len(body):
+                return ""
+            start = offset
+            while offset < len(body) and body[offset] != 0:
+                offset += 1
+            result = body[start:offset].decode('ascii', errors='ignore')
+            if offset < len(body):
+                offset += 1  # skip null terminator
+            return result
+        
+        # Parse mandatory fields
+        try:
+            # service_type
+            fields['service_type'] = read_cstring_safe()
+            
+            # source_addr_ton, source_addr_npi
+            if offset + 2 <= len(body):
+                fields['source_addr_ton'] = body[offset]
+                offset += 1
+                fields['source_addr_npi'] = body[offset]
+                offset += 1
+            
+            # source_addr
+            fields['source_addr'] = read_cstring_safe()
+            
+            # dest_addr_ton, dest_addr_npi
+            if offset + 2 <= len(body):
+                fields['dest_addr_ton'] = body[offset]
+                offset += 1
+                fields['dest_addr_npi'] = body[offset]
+                offset += 1
+            
+            # destination_addr
+            fields['dest_addr'] = read_cstring_safe()
+            
+            # esm_class, protocol_id, priority_flag
+            if offset + 3 <= len(body):
+                fields['esm_class'] = body[offset]
+                offset += 1
+                fields['protocol_id'] = body[offset]
+                offset += 1
+                fields['priority_flag'] = body[offset]
+                offset += 1
+            
+            # schedule_delivery_time
+            fields['schedule_delivery_time'] = read_cstring_safe()
+            
+            # validity_period
+            fields['validity_period'] = read_cstring_safe()
+            
+            # registered_delivery, replace_if_present_flag, data_coding, sm_default_msg_id
+            if offset + 4 <= len(body):
+                fields['registered_delivery'] = body[offset]
+                offset += 1
+                fields['replace_if_present_flag'] = body[offset]
+                offset += 1
+                fields['data_coding'] = body[offset]
+                offset += 1
+                fields['sm_default_msg_id'] = body[offset]
+                offset += 1
+            
+            # sm_length
+            if offset < len(body):
+                sm_length = body[offset]
+                offset += 1
+                
+                # short_message
+                if offset + sm_length <= len(body):
+                    fields['short_message'] = body[offset:offset + sm_length]
+                else:
+                    # Jika sm_length terlalu besar, ambil sampai akhir body
+                    fields['short_message'] = body[offset:]
+            else:
+                fields['short_message'] = b''
+                
+        except Exception as e:
+            print(f"⚠️ Warning in parse_deliver_sm: {e}")
+            # Fallback: return empty but don't crash
+        
+        # DEBUG: Log parsed fields
+        print(f"🔍 parse_deliver_sm - Parsed fields: {list(fields.keys())}")
+        if 'short_message' in fields:
+            print(f"🔍 parse_deliver_sm - short_message: {fields['short_message']}")
+            print(f"🔍 parse_deliver_sm - short_message text: {fields['short_message'].decode('ascii', errors='ignore')}")
+        
+        return {
+            "source_addr": fields.get('source_addr', ''),
+            "dest_addr": fields.get('dest_addr', ''),
+            "text": fields.get('short_message', b'')
+        }
+        
+    except Exception as e:
+        print(f"❌ Critical error in parse_deliver_sm: {e}")
+        # Return the raw body for manual parsing
+        return {
+            "source_addr": "",
+            "dest_addr": "", 
+            "text": body  # Return full body as fallback
+        }
+def build_deliver_sm_dlr(msg_id: str, source_addr: str, dest_addr: str, stat: str = "", sequence: int = 1) -> bytes:
+    """
+    Build deliver_sm PDU for DLR with proper status handling.
+    If stat is empty, default to UNKNOWN instead of DELIVRD.
+    """
+    # Validate and normalize status
+    normalized_stat = normalize_dlr_status(stat) if stat else "UNKNOWN"
+    
+    # Validate it's a known status
+    if normalized_stat not in DLR_STATUS_MAP and normalized_stat not in ["0", "1", "2", "3", "4", "5", "6"]:
+        normalized_stat = "UNKNOWN"
+    
     now = strftime("%y%m%d%H%M")
-    dlr_text = (f"id:{msg_id} sub:001 dlvrd:001 submit date:{now} done date:{now}"f"stat:{stat} err:000 text:DLR").encode("ascii")
+    dlr_text = (f"id:{msg_id} sub:001 dlvrd:001 submit date:{now} done date:{now} stat:{normalized_stat} err:000 text:DLR").encode("ascii")
+    
     body = b"".join([
         cstring(""),        # service_type
         struct.pack(">B", Ton.INTERNATIONAL),
         struct.pack(">B", Npi.ISDN),
-        cstring(source_addr),       # source_addr
+        cstring(source_addr),
         struct.pack(">B", Ton.INTERNATIONAL),
         struct.pack(">B", Npi.ISDN),
-        cstring(dest_addr),         # destination_addr
-        struct.pack(">B", 0),       # esm_class (default)
+        cstring(dest_addr),
+        struct.pack(">B", 0x04),    # esm_class: delivery receipt
         struct.pack(">B", 0),       # protocol_id
         struct.pack(">B", 0),       # priority_flag
         cstring(""),                # schedule_delivery_time
@@ -408,3 +525,42 @@ def strip_udh_and_decode(short_message: bytes, data_coding: int) -> str:
         return payload.decode("utf-16-be", errors="replace")
     else:
         return payload.decode("ascii", errors="replace")
+    
+def clean_smpp_string(s: str) -> str:
+    """Bersihkan string dari null characters dan whitespace tidak diinginkan"""
+    if not s:
+        return s
+    # Hapus null characters dan split pada null terminator pertama
+    cleaned = s.split('\x00')[0]
+    # Hapus karakter kontrol lainnya jika ada
+    cleaned = ''.join(char for char in cleaned if ord(char) >= 32 or char in '\t\n\r')
+    return cleaned.strip()
+
+def normalize_dlr_status(status: str) -> str:
+    """Normalize DLR status to standard SMPP status codes."""
+    if not status:
+        return "UNKNOWN"
+    
+    status_upper = status.upper().strip()
+
+    # Handle numeric status codes
+    if status_upper in ["0", "1", "2", "3", "4", "5", "6"]:
+        return DLR_STATUS_MAP.get(status_upper, "UNKNOWN")
+    
+    # Handle common status variations
+    status_mapping = {
+        "DELIVERED": "DELIVRD",
+        "ACCEPTED": "ACCEPTD", 
+        "UNDELIVERABLE": "UNDELIV",
+        "FAILED": "UNDELIV",
+        "ENROUTE": "ACCEPTD",
+        "REJECTED": "REJECTD"
+    }
+    
+    # Return mapped status or original if no mapping found
+    return status_mapping.get(status_upper, status_upper)
+    
+def get_dlr_status_description(status: str) -> str:
+    """Get human readable description for DLR status"""
+    status = normalize_dlr_status(status)
+    return DLR_STATUS_MAP.get(status, f"Unknown status: {status}")

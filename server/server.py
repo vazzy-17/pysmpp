@@ -1,6 +1,3 @@
-# server.py
-
-
 from __future__ import annotations
 from server.db import DB
 from dotenv import load_dotenv
@@ -11,6 +8,7 @@ import logging
 import uuid
 import struct
 from server.credential_watcher import GLOBAL_CREDENTIALS, load_credentials, apply_new_credentials
+
 # Di level global
 dict_lock = asyncio.Lock()
 
@@ -21,17 +19,12 @@ from server.smpp_common import (
     PDU, CommandId, CommandStatus, Ton, Npi, DLR_STATUS_MAP,
     build_bind_transceiver_resp, parse_bind_transceiver_body,
     build_enquire_link_resp, build_submit_sm, parse_submit_sm_body,
-    strip_udh_and_decode, build_deliver_sm_dlr, read_cstring,
-    SUPPLIER_CLIENT, CLIENT_SESSIONS
+    strip_udh_and_decode, build_deliver_sm_dlr, parse_deliver_sm, clean_smpp_string,
+    SUPPLIER_CLIENT, CLIENT_SESSIONS, SUPPLIER_TO_CLIENT_MSGID, CLIENT_MSGID_MAP
 )
 
 load_dotenv()
-db=DB(os.getenv("DATABASE_URL2"))
-# # -----------------------------
-# # Credential store (dynamic)
-# # -----------------------------
-SUPPLIER_TO_CLIENT_MSGID = {}
-CLIENT_MSGID_MAP = {}
+db = DB(os.getenv("DATABASE_URL2"))
 
 def apply_new_credentials(new_creds: dict):
     GLOBAL_CREDENTIALS.clear()
@@ -47,6 +40,17 @@ class SmppServerProtocol(asyncio.Protocol):
         self.min_version = min_version
         self.max_version = max_version
         self.logger = logging.getLogger("smpp.server")
+        self._write_lock = asyncio.Lock()
+
+    async def safe_write(self, data):
+        async with self._write_lock:
+            if self.transport and not self.transport.is_closing():
+                self.transport.write(data)
+
+    async def next_seq(self):
+        async with self._write_lock:
+            self.sequence += 1
+            return self.sequence  # ✅ RETURN DALAM LOCK SCOPE
 
     def connection_made(self, transport: asyncio.Transport):
         self.transport = transport
@@ -57,19 +61,32 @@ class SmppServerProtocol(asyncio.Protocol):
         asyncio.create_task(self._handle(data))
 
     def connection_lost(self, exc):
-        if self.bound and self.expected_system_id in CLIENT_SESSIONS:
-            del CLIENT_SESSIONS[self.expected_system_id]
+        if self.bound and self.expected_system_id:
+            asyncio.create_task(self.remove_client_session())
         self.logger.info(f"Connection lost: {self.peer}")
-    
-    
 
+    async def remove_client_session(self):
+        """Thread-safe way to remove client session"""
+        async with dict_lock:
+            if self.expected_system_id in CLIENT_SESSIONS:
+                del CLIENT_SESSIONS[self.expected_system_id]
+                self.logger.info(f"Removed client session: {self.expected_system_id}")
+
+    # ----------------------------
+    # Helper: Kirim DLR nanti
+    # ----------------------------
     async def send_dlr_later(self, msg_id, source, dest, delay=2.0, status_code=0):
         await asyncio.sleep(delay)
         if self.transport and self.bound:
-            self.sequence += 1
-            dlr_pdu = build_deliver_sm_dlr(msg_id, source, dest, DLR_STATUS_MAP.get(status_code, "UNKNOWN"), self.sequence)
-            self.transport.write(dlr_pdu)
+            sequence = await self.next_seq()
+            dlr_pdu = build_deliver_sm_dlr(
+                msg_id, source, dest, DLR_STATUS_MAP.get(status_code, "UNKNOWN"), sequence
+            )
+            await self.safe_write(dlr_pdu)
 
+    # ----------------------------
+    # Parser PDU
+    # ----------------------------
     async def _handle(self, data: bytes):
         offset = 0
         while offset + 4 <= len(data):
@@ -83,16 +100,22 @@ class SmppServerProtocol(asyncio.Protocol):
             except Exception as e:
                 self.logger.exception("Failed to unpack PDU: %s", e)
                 nack = PDU(CommandId.generic_nack, CommandStatus.ESME_RINVCMDLEN, 0, b"")
-                self.transport.write(nack.pack())
+                await self.safe_write(nack.pack())
                 return
 
             await self._process_pdu(pdu)
             offset += length
 
+    # ----------------------------
+    # Process masing-masing PDU
+    # ----------------------------
     async def _process_pdu(self, pdu: PDU):
+        # ----------------------------
+        # Bind transceiver
+        # ----------------------------
         if pdu.command_id == CommandId.bind_transceiver:
             params = parse_bind_transceiver_body(pdu.body)
-            self.logger.info(f"Bind from {params['system_id']}")
+            self.logger.info(f"📥 Bind request from {params['system_id']}")
 
             ver = params["interface_version"]
             if not (self.min_version <= ver <= self.max_version):
@@ -106,101 +129,233 @@ class SmppServerProtocol(asyncio.Protocol):
             else:
                 status = CommandStatus.ESME_ROK
                 self.bound = True
-                self.expected_system_id = params["system_id"]
+                self.system_id = params["system_id"]
+                self.expected_system_id = self.system_id
 
                 async with dict_lock:
-                    CLIENT_SESSIONS[params["system_id"]] = self
+                    CLIENT_SESSIONS[self.system_id] = self
+
+                self.logger.info(f"✅ Client bound and registered: {self.system_id}")
 
             resp = build_bind_transceiver_resp(params["system_id"], status, pdu.sequence)
-            self.transport.write(resp)
+            await self.safe_write(resp)
             return
 
+        # ----------------------------
+        # Enquire link
+        # ----------------------------
         if pdu.command_id == CommandId.enquire_link:
-            self.transport.write(build_enquire_link_resp(pdu.sequence))
+            resp = build_enquire_link_resp(pdu.sequence)
+            await self.safe_write(resp)
             return
 
+        # ----------------------------
+        # Submit SM
+        # ----------------------------
         if pdu.command_id == CommandId.submit_sm:
             msg = parse_submit_sm_body(pdu.body)
-            async with dict_lock:
-                CLIENT_SESSIONS[msg["source_addr"]] = self
             decoded_text = strip_udh_and_decode(msg["short_message"], msg["data_coding"])
-            
-            # raw_msg_id = str(uuid.uuid4())
-            peer_ip, _ = self.transport.get_extra_info("peername")
+
+            # Ambil IP client
+            peer = self.transport.get_extra_info("peername")
+            peer_ip = peer[0] if peer else "unknown"
             try:
                 account_ip_id = await db.get_account_ip_id(peer_ip)
             except ValueError as e:
                 self.logger.error(f"❌ {e}")
+                status = CommandStatus.ESME_RSYSERR
+                resp = PDU(CommandId.submit_sm_resp, status, pdu.sequence, b"\x00").pack()
+                await self.safe_write(resp)
                 return
 
+            # Simpan log
             raw_msg_id = await db.insert_log(
                 source=msg["source_addr"],
                 msisdn=msg["dest_addr"],
                 message=decoded_text,
-                account_ip = account_ip_id,
-                gtw_id= int(os.getenv("GTW_ID",4)),
+                account_ip=account_ip_id,
+                gtw_id=int(os.getenv("GTW_ID", 4)),
                 telco_id=7
             )
 
+            # Simpan mapping client msg
             async with dict_lock:
                 CLIENT_MSGID_MAP[raw_msg_id] = {
                     "source_addr": msg["source_addr"],
-                    "dest_addr": msg["dest_addr"]
+                    "dest_addr": msg["dest_addr"],
+                    "system_id": self.expected_system_id
                 }
 
+            # Kirim ke supplier
+            status = CommandStatus.ESME_RSYSERR
             if SUPPLIER_CLIENT:
                 responses = await SUPPLIER_CLIENT.submit_sm(msg["source_addr"], msg["dest_addr"], decoded_text)
-                status = responses[0].command_status if responses else CommandStatus.ESME_RSYSERR
-
                 if responses and responses[0].body:
-                    msgid_supplier = responses[0].body.rstrip(b"\x00").decode("ascii", errors="ignore")
-                    SUPPLIER_TO_CLIENT_MSGID[msgid_supplier] = raw_msg_id
-            else:
-                status = CommandStatus.ESME_RSYSERR
+                    raw_bytes = responses[0].body
+                    self.logger.info(f"🔍 RAW supplier_msgid bytes: {raw_bytes}")
+                    self.logger.info(f"🔍 RAW supplier_msgid hex: {raw_bytes.hex()}")
+                    
+                    supplier_msgid = raw_bytes.decode("ascii", errors="ignore")
+                    supplier_msgid = supplier_msgid.replace('\x00', '').strip()
+                    
+                    self.logger.info(f"🔍 FINAL supplier_msgid: '{supplier_msgid}'")
+                    self.logger.info(f"🔍 FINAL length: {len(supplier_msgid)}")
+                    self.logger.info(f"🔍 FINAL repr: {repr(supplier_msgid)}")
+                    
+                    async with dict_lock:
+                        SUPPLIER_TO_CLIENT_MSGID[supplier_msgid] = raw_msg_id
+                        
+                    self.logger.info(f"✅ Mapping saved: '{supplier_msgid}' -> {raw_msg_id}")
+                    
+                    current_keys = list(SUPPLIER_TO_CLIENT_MSGID.keys())
+                    self.logger.info(f"📋 All current mappings: {current_keys}")
+                    
+                    status = responses[0].command_status
 
-            # Gunakan status yang sudah dicek
-            msg_id = raw_msg_id.encode("ascii") + b"\x00"
-            resp = PDU(CommandId.submit_sm_resp, status, pdu.sequence, msg_id).pack()
-            self.transport.write(resp)
-
-            await self.send_dlr_later(raw_msg_id,msg["source_addr"], msg["dest_addr"])
+            # Kirim submit_sm_resp
+            msg_id_bytes = raw_msg_id.encode("ascii") + b"\x00"
+            resp = PDU(CommandId.submit_sm_resp, status, pdu.sequence, msg_id_bytes).pack()
+            await self.safe_write(resp)
             return
 
+        # ----------------------------
+        # Deliver SM (DLR)
+        # ----------------------------
+        if pdu.command_id == CommandId.deliver_sm:
+            self.logger.info("📩 Received deliver_sm (likely DLR)")
+            msg = parse_deliver_sm(pdu.body)
+            text_bytes = msg.get("text", b"")
+            text = text_bytes.decode("ascii", errors="replace")
+            self.logger.info(f"📨 Decoded DLR text: {text}")
+
+            # Parse supplier DLR dengan handling yang lebih robust
+            supplier_msgid = None
+            status = "UNKNOWN"
+            
+            try:
+                fields = {}
+                for item in text.split():
+                    if ":" in item:
+                        key, value = item.split(":", 1)
+                        fields[key.lower()] = value.strip()
+                
+                supplier_msgid = fields.get("id") or fields.get("messageid") or fields.get("msgid") or ""
+                status = fields.get("stat") or fields.get("status") or fields.get("state") or "UNKNOWN"
+                
+                supplier_msgid = supplier_msgid.split('\x00')[0].strip()
+                status = status.upper().strip()
+                
+                self.logger.info(f"🆔 Parsed DLR - Message ID: {supplier_msgid}, Status: {status}")
+                
+            except Exception as e:
+                self.logger.error(f"❌ Failed to parse DLR: {text} | Error: {e}")
+                return
+
+            if not supplier_msgid:
+                self.logger.warning("❗ Supplier DLR missing msgid")
+                return
+
+            # ✅ PERBAIKAN: Safe dictionary access dengan error handling
+            client_msgid = None
+            info = None
+            client_session = None
+            
+            async with dict_lock:
+                client_msgid = SUPPLIER_TO_CLIENT_MSGID.get(supplier_msgid)
+                if client_msgid:
+                    info = CLIENT_MSGID_MAP.get(client_msgid)
+                    if info and info.get("system_id"):
+                        client_session = CLIENT_SESSIONS.get(info["system_id"])
+
+            if not info or not client_session or not client_session.bound:
+                self.logger.warning(f"❗ Client session untuk msg_id {supplier_msgid} tidak ditemukan. DLR dropped.")
+                self.logger.info(f"   Available mappings: {list(SUPPLIER_TO_CLIENT_MSGID.keys())}")
+                return
+
+            # ✅ PERBAIKAN: Thread-safe sequence handling
+            try:
+                if hasattr(client_session, 'next_seq'):
+                    sequence = await client_session.next_seq()
+                else:
+                    # Fallback dengan lock manual
+                    if hasattr(client_session, '_write_lock'):
+                        async with client_session._write_lock:
+                            client_session.sequence += 1
+                            sequence = client_session.sequence
+                    else:
+                        # Last resort
+                        client_session.sequence += 1
+                        sequence = client_session.sequence
+
+                dlr_pdu = build_deliver_sm_dlr(
+                    msg_id=client_msgid,
+                    source_addr=info["source_addr"],
+                    dest_addr=info["dest_addr"],
+                    stat=status,
+                    sequence=sequence
+                )
+
+                if hasattr(client_session, 'safe_write'):
+                    await client_session.safe_write(dlr_pdu)
+                else:
+                    client_session.transport.write(dlr_pdu)
+                    
+                self.logger.info(f"✅ Forwarded DLR to client: {info['system_id']}, msgid={client_msgid}, status={status}")
+                
+                # ✅ PERBAIKAN: Hapus mapping dengan pop() yang lebih safe
+                async with dict_lock:
+                    SUPPLIER_TO_CLIENT_MSGID.pop(supplier_msgid, None)
+                    CLIENT_MSGID_MAP.pop(client_msgid, None)
+                        
+            except Exception as e:
+                self.logger.error(f"❌ Failed to forward DLR to client {info['system_id']}: {e}")
+            return
+
+        # ----------------------------
+        # deliver_sm_resp
+        # ----------------------------
         if pdu.command_id == CommandId.deliver_sm_resp:
             self.logger.debug("Received deliver_sm_resp (DLR ack)")
             return
 
-        self.transport.write(PDU(CommandId.generic_nack, CommandStatus.ESME_RINVCMDID, pdu.sequence, b"").pack())
+        # ----------------------------
+        # Generic NACK
+        # ----------------------------
+        nack = PDU(CommandId.generic_nack, CommandStatus.ESME_RINVCMDID, pdu.sequence, b"").pack()
+        await self.safe_write(nack)
+
+async def cleanup_existing_mappings():
+    """Bersihkan existing mappings dari null characters"""
+    async with dict_lock:
+        cleaned = {}
+        for key, value in SUPPLIER_TO_CLIENT_MSGID.items():
+            clean_key = key.replace('\x00', '').strip() if isinstance(key, str) else key
+            cleaned[clean_key] = value
+        SUPPLIER_TO_CLIENT_MSGID.clear()
+        SUPPLIER_TO_CLIENT_MSGID.update(cleaned)
+        logging.info(f"🧹 Cleaned existing mappings: {list(SUPPLIER_TO_CLIENT_MSGID.keys())}")
 
 # ----------------------------------------
 # Main server entry
 # ----------------------------------------
 async def run_server():
-    # logging.basicConfig(level=logging.DEBUG)
-
     file_handler = logging.FileHandler('pysmpp.log')
-    fromatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    file_handler.setFormatter(fromatter)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler.setFormatter(formatter)
     logging.basicConfig(level='DEBUG', handlers=[file_handler])
 
-    # creds = load_credentials("credentials.txt")
     import os
     current_dir = os.path.dirname(__file__)
 
-    # creds = load_credentials(os.path.join(current_dir, "credentials.txt"))
-    # GLOBAL_CREDENTIALS.update(creds)
-    # start_credential_watcher("credentials.txt", apply_new_credentials)
     await db.connect()
     creds = await load_credentials(db)
     apply_new_credentials(creds)
 
-    
-
-    from client.client_01 import SmppClient  # import here to avoid circular import
+    from client.client_01 import SmppClient
 
     global SUPPLIER_CLIENT
-    SUPPLIER_CLIENT = SmppClient("103.65.237.145", 37001, "ptest001", "Pasming")
-    # SUPPLIER_CLIENT = SmppClient("127.0.0.1", 2025, "aggregator", "aggregatorpass")
+    # SUPPLIER_CLIENT = SmppClient("103.65.237.145", 37001, "ptest001", "Pasming")
+    SUPPLIER_CLIENT = SmppClient("127.0.0.1", 2025, "aggregator", "aggregatorpass")
     # SUPPLIER_CLIENT = SmppClient("sms-gw.redision.com", 37002, "dwi_test", "123456")
     await SUPPLIER_CLIENT.connect()
     await SUPPLIER_CLIENT.bind_transceiver()
