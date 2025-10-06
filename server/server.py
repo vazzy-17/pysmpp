@@ -192,23 +192,23 @@ class SmppServerProtocol(asyncio.Protocol):
                 responses = await SUPPLIER_CLIENT.submit_sm(msg["source_addr"], msg["dest_addr"], decoded_text)
                 if responses and responses[0].body:
                     raw_bytes = responses[0].body
-                    self.logger.info(f"🔍 RAW supplier_msgid bytes: {raw_bytes}")
-                    self.logger.info(f"🔍 RAW supplier_msgid hex: {raw_bytes.hex()}")
+                    # self.logger.info(f"🔍 RAW supplier_msgid bytes: {raw_bytes}")
+                    # self.logger.info(f"🔍 RAW supplier_msgid hex: {raw_bytes.hex()}")
                     
                     supplier_msgid = raw_bytes.decode("ascii", errors="ignore")
                     supplier_msgid = supplier_msgid.replace('\x00', '').strip()
                     
-                    self.logger.info(f"🔍 FINAL supplier_msgid: '{supplier_msgid}'")
-                    self.logger.info(f"🔍 FINAL length: {len(supplier_msgid)}")
-                    self.logger.info(f"🔍 FINAL repr: {repr(supplier_msgid)}")
+                    # self.logger.info(f"🔍 FINAL supplier_msgid: '{supplier_msgid}'")
+                    # self.logger.info(f"🔍 FINAL length: {len(supplier_msgid)}")
+                    # self.logger.info(f"🔍 FINAL repr: {repr(supplier_msgid)}")
                     
                     async with dict_lock:
                         SUPPLIER_TO_CLIENT_MSGID[supplier_msgid] = raw_msg_id
                         
-                    self.logger.info(f"✅ Mapping saved: '{supplier_msgid}' -> {raw_msg_id}")
+                    # self.logger.info(f"✅ Mapping saved: '{supplier_msgid}' -> {raw_msg_id}")
                     
                     current_keys = list(SUPPLIER_TO_CLIENT_MSGID.keys())
-                    self.logger.info(f"📋 All current mappings: {current_keys}")
+                    # self.logger.info(f"📋 All current mappings: {current_keys}")
                     
                     status = responses[0].command_status
 

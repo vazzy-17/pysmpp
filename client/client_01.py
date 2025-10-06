@@ -32,18 +32,15 @@ class SmppClient:
         self.writer = None
         self.logger = logging.getLogger("smpp.client")
         self._pending = {}
-        # ✅ PERBAIKAN: GUNAKAN threading.Lock UNTUK SYNCHRONOUS OPERATIONS
-        self._seq_lock = threading.Lock()
+        self._seq_lock = asyncio.Lock()
         self._pending_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
 
-    # ✅ METHOD Thread-safe sequence - FIXED
-    def next_seq(self):
-        with self._seq_lock:
+    async def next_seq(self):
+        async with self._seq_lock:
             self.sequence += 1
             return self.sequence
-
-    # ✅ METHOD Thread-safe pending management  
+ 
     async def add_pending(self, seq, future):
         async with self._pending_lock:
             self._pending[seq] = future
@@ -52,7 +49,6 @@ class SmppClient:
         async with self._pending_lock:
             return self._pending.pop(seq, None)
 
-    # ✅ METHOD Thread-safe write
     async def safe_write(self, data):
         async with self._write_lock:
             if self.writer and not self.writer.is_closing():
@@ -64,7 +60,6 @@ class SmppClient:
         self.logger.info("Connected to %s:%s", self.host, self.port)
 
     async def bind_transceiver(self):
-        # ✅ SEKARANG AMAN - next_seq() menggunakan threading.Lock
         seq = self.next_seq()
         pdu = build_bind_transceiver(self.system_id, self.password, "", sequence=seq)
 
@@ -73,7 +68,6 @@ class SmppClient:
 
         await self.safe_write(pdu)
 
-        # Jalankan loop pembaca permanen dan keepalive
         asyncio.create_task(self._receiver_loop())
         asyncio.create_task(self._keepalive())
 
@@ -192,7 +186,7 @@ class SmppClient:
         # ========== IMPROVED DLR PARSING ==========
         text = text.replace('\x00', '').strip()
         
-        logging.info(f"🔍 Raw DLR text for parsing: '{text}'")
+        # logging.info(f"🔍 Raw DLR text for parsing: '{text}'")
         
         supplier_msgid = None
         stat = "UNKNOWN"
@@ -232,13 +226,13 @@ class SmppClient:
             logging.warning(f"❗ Tidak dapat extract supplier_msgid dari DLR: {text}")
             return
 
-        logging.info(f"🆔 Supplier DLR - Message ID: '{supplier_msgid}', Status: {stat}")
+        # logging.info(f"🆔 Supplier DLR - Message ID: '{supplier_msgid}', Status: {stat}")
 
         # ========== DEBUG: Log semua available mappings ==========
         async with dict_lock:
             available_keys = list(SUPPLIER_TO_CLIENT_MSGID.keys())
-        logging.info(f"🔍 Available mappings: {available_keys}")
-        logging.info(f"🔍 Looking for: '{supplier_msgid}'")
+        # logging.info(f"🔍 Available mappings: {available_keys}")
+        # logging.info(f"🔍 Looking for: '{supplier_msgid}'")
 
         # Mapping ke client
         client_msgid = None
